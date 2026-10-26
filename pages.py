@@ -1,0 +1,407 @@
+"""Page entry points used by ``st.navigation``."""
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from ..structure import display_sheet
+from .. import config
+from ..dashboard_service import apply_filters, describe_filters
+from ..data_loader import DataLoadError
+from ..data_profiler import DATE, METRIC
+from ..powerbi_export import PowerBIExportError, build_powerbi_project
+from ..formatting import format_value
+from ..storage import StorageError
+from . import state
+from .dashboard_view import render_dashboard
+from .theme import card, chips, date_column_config, empty_state, esc, human_size, page_header
+from .upload_view import render_landing, render_staging
+from .analyst_view import analyst_page  # noqa: F401  (page entry point)
+
+
+def shared_dashboard_page() -> None:
+    token = st.query_params.get("share", "")
+    try:
+        cfg = state.get_storage().load_shared_dashboard(token)
+    except StorageError as exc:
+        st.error(f"This share link could not be opened: {exc}")
+        return
+    if cfg is None:
+        st.error("This share link is invalid or has been revoked.")
+        return
+    st.info(
+        "Shared dashboard · view only. Charts, metric values, and filters are visible to anyone with this link. "
+        "The original file and row-level data preview are not available here."
+    )
+    render_dashboard(cfg, read_only=True)
+
+
+def overview_page() -> None:
+    if st.session_state.get("staging"):
+        render_staging(st.session_state["staging"])
+    elif state.current_dashboard():
+        render_dashboard(state.current_dashboard())
+    else:
+        render_landing()
+
+
+def _import_bundle_box(storage) -> None:
+    with st.expander("Import a dashboard file (.dashboard.zip)", icon=":material/upload:",
+                     expanded=config.ONLINE and not storage.list_dashboards()):
+        st.caption("Restore a dashboard you downloaded earlier. It includes the settings and the original data file.")
+        up = st.file_uploader("Dashboard file", type=["zip"], key="bundle_upload", label_visibility="collapsed")
+        if up is not None and st.session_state.get("bundle_done") != up.file_id:
+            st.session_state["bundle_done"] = up.file_id
+            try:
+                cfg = storage.import_bundle(up.getvalue())
+                state.open_dashboard(cfg["id"])
+            except (StorageError, DataLoadError) as exc:
+                st.error(str(exc))
+                return
+            st.switch_page(st.session_state["_pages"]["overview"])
+
+
+def dashboards_page() -> None:
+    subtitle = ("Dashboards for this browser session only. Download them to keep them; they are deleted after "
+                f"{config.SESSION_TTL_MINUTES // 60} hours of inactivity." if config.ONLINE
+                else "Dashboards are saved on this computer. Use Power BI on a dashboard card to export an editable .pbip project.")
+    page_header("Library", "My dashboards", subtitle)
+    st.write("")
+    storage = state.get_storage()
+    _import_bundle_box(storage)
+    items = storage.list_dashboards()
+    if not items:
+        empty_state("No saved dashboards", "Go to Overview and upload a spreadsheet to create one, or import a dashboard file.")
+        return
+    query = st.text_input("Search", placeholder="Filter by name or file", label_visibility="collapsed")
+    if query:
+        ql = query.lower()
+        items = [d for d in items if ql in str(d.get("name", "")).lower() or ql in str(d.get("dataset_name", "")).lower()]
+    current = state.current_dashboard()
+    for d in items:
+        with card(f"dash_{d['id']}"):
+            if d.get("error"):
+                c1, c2 = st.columns([5, 1], vertical_alignment="center")
+                c1.markdown(f"**{esc(d['id'])}.json** — {esc(d['error'])}")
+                if c2.button("Delete file", key=f"bad_del_{d['id']}"):
+                    storage.delete_dashboard(d["id"])
+                    st.rerun()
+                continue
+            c1, c2 = st.columns([5, 4], vertical_alignment="center")
+            with c1:
+                tag = " · open now" if current and current.get("id") == d["id"] else ""
+                st.markdown(f"**{esc(d['name'])}**{tag}")
+                sheet = f" · sheet {display_sheet(d['sheet'])}" if d.get("sheet") and d["sheet"] != "CSV data" else ""
+                st.caption(f"{d.get('dataset_name') or 'Dataset'}{sheet} · {d['n_kpis']} KPIs · {d['n_charts']} charts · "
+                           f"updated {str(d.get('updated_at') or '')[:16].replace('T', ' ')} UTC")
+            with c2:
+                b1, b5, b2 = st.columns(3)
+                if b1.button("Open", key=f"open_{d['id']}", type="primary", width="stretch"):
+                    try:
+                        state.open_dashboard(d["id"])
+                    except (StorageError, DataLoadError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.switch_page(st.session_state["_pages"]["overview"])
+                with b5.popover("Power BI", icon=":material/analytics:", width="stretch",
+                                help="Export an editable Power BI Desktop project"):
+                    st.caption("Download an editable Power BI project. Extract the ZIP and open the .pbip file in Power BI Desktop.")
+                    if st.button("Prepare Power BI project", key=f"pbi_prep_{d['id']}", width="stretch"):
+                        try:
+                            cfg = storage.load_dashboard(d["id"])
+                            with st.spinner("Preparing the Power BI project…"):
+                                _, result, profile, data_warnings = state.load_dashboard_data(cfg)
+                                filtered = apply_filters(result.df, cfg.get("filters"), profile)
+                                fname, blob, export_warnings = build_powerbi_project(cfg, filtered, profile)
+                            st.session_state[f"pbi_ready_{d['id']}"] = (fname, blob, data_warnings + export_warnings)
+                        except (StorageError, DataLoadError, PowerBIExportError) as exc:
+                            st.error(f"Could not prepare the Power BI project: {exc}")
+                    pbi_export = st.session_state.get(f"pbi_ready_{d['id']}")
+                    if pbi_export:
+                        fname, blob, export_warnings = pbi_export
+                        for warning in export_warnings:
+                            st.warning(warning)
+                        st.download_button(
+                            "Download Power BI project (.pbip.zip)",
+                            blob,
+                            file_name=fname,
+                            mime="application/zip",
+                            key=f"pbi_dl_{d['id']}",
+                            type="primary",
+                            width="stretch",
+                        )
+                with b2.popover("More", icon=":material/more_horiz:", width="stretch"):
+                    st.caption("App backup is for restoring this dashboard in this app; it is not a Power BI file.")
+                    if st.button("Prepare app backup", key=f"dl_prep_{d['id']}", width="stretch"):
+                        st.session_state[f"dl_ready_{d['id']}"] = True
+                    if st.session_state.get(f"dl_ready_{d['id']}"):
+                        try:
+                            fname, blob = storage.export_bundle(d["id"])
+                            st.download_button("Download app backup (.dashboard.zip)", blob, file_name=fname,
+                                               mime="application/zip", key=f"dl_{d['id']}",
+                                               width="stretch")
+                        except StorageError as exc:
+                            st.error(str(exc))
+                    st.divider()
+                    with st.popover("Rename", width="stretch"):
+                        name = st.text_input("New name", value=d["name"], key=f"rn_{d['id']}", max_chars=120)
+                        if st.button("Save name", key=f"rn_btn_{d['id']}"):
+                            try:
+                                storage.rename_dashboard(d["id"], name)
+                                if current and current.get("id") == d["id"]:
+                                    current["name"] = name.strip()
+                                    state.save_current()
+                                st.rerun()
+                            except StorageError as exc:
+                                st.error(str(exc))
+                    if st.button("Copy dashboard", key=f"dup_{d['id']}", width="stretch"):
+                        storage.duplicate_dashboard(d["id"])
+                        st.rerun()
+                    with st.popover("Delete", width="stretch"):
+                        st.write("Delete this dashboard? The uploaded file is kept.")
+                        if st.button("Delete", key=f"del_{d['id']}", type="primary"):
+                            storage.delete_dashboard(d["id"])
+                            if current and current.get("id") == d["id"]:
+                                state.close_dashboard()
+                            st.rerun()
+
+
+def _explorer_sources(cfg, staging, sess) -> dict[str, str]:
+    out = {}
+    if sess:
+        out["analysis"] = "Cleaned data from the AI analysis"
+    if cfg:
+        out["dashboard"] = f"Dashboard: {cfg['name'][:40]}"
+    elif staging:
+        out["staging"] = "Uploaded file (not cleaned yet)"
+    return out
+
+
+def explorer_page() -> None:
+    from ..agent.quality import quality_score
+
+    cfg = state.current_dashboard()
+    staging = st.session_state.get("staging")
+    sess = st.session_state.get("analysis")
+    sources = _explorer_sources(cfg, staging, sess)
+    if not sources:
+        page_header("Data", "Data explorer")
+        st.write("")
+        empty_state("No dataset open", "Start an AI analysis, open a dashboard, or upload a file on the Dashboard page.")
+        return
+    kind = next(iter(sources))
+    if len(sources) > 1:
+        kind = st.segmented_control("Data source", list(sources), format_func=sources.get, default=kind,
+                                    key="explorer_source") or kind
+    log: list[dict] = []
+    try:
+        if kind == "analysis":
+            from .analyst_view import _context
+
+            ctx = _context(sess)
+            df, profile = ctx.working()
+            result = ctx.original
+            meta = state.get_storage().get_dataset(sess["dataset_id"])
+            log = ctx.memory.transformations
+        elif kind == "dashboard":
+            meta, result, profile, _ = state.load_dashboard_data(cfg)
+            df = result.df
+        else:
+            meta, result, profile = state.load_for(staging["dataset_id"], staging.get("sheet"), staging.get("header_row"))
+            df = result.df
+    except (StorageError, DataLoadError) as exc:
+        st.error(str(exc))
+        return
+    page_header("Data", "Data explorer", f"{meta['original_name']} · {display_sheet(result.sheet)}")
+    if kind == "analysis":
+        st.caption("This is the working copy your AI analysis uses: the clean-up you approved is applied. "
+                   "Your original file is unchanged.")
+    q = quality_score(df, profile)
+    cfg = cfg if kind == "dashboard" else None
+    use_filters = False
+    if cfg and (cfg["filters"]["categorical"] or cfg["filters"]["date"]):
+        use_filters = st.toggle(f"Apply dashboard filters ({describe_filters(cfg['filters'])})", value=False)
+    data = apply_filters(df, cfg["filters"], profile) if use_filters else df
+    chips([(f"{len(data):,} rows", "accent"), (f"{profile.n_cols} columns", ""),
+           (f"Data quality {q['score']}/100 · {q['grade']}", "" if q["score"] >= 75 else "warn"),
+           (f"{profile.duplicate_rows:,} duplicate rows", "warn" if profile.duplicate_rows else ""),
+           (f"{profile.missing_pct:.1f}% cells missing", "warn" if profile.missing_pct > 5 else "")])
+    st.write("")
+    tab_data, tab_profile, tab_col, tab_notes = st.tabs(["Rows", "Column profile", "Column detail", "Cleaning log"])
+
+    with tab_data:
+        c1, c2, c3 = st.columns([2, 2, 1])
+        search = c1.text_input("Search all text columns", placeholder="Contains…")
+        cols = c2.multiselect("Columns", list(df.columns), placeholder="All columns")
+        limit = c3.selectbox("Rows", [100, 500, 1000, 5000], index=1)
+        view = data
+        if search:
+            text_cols = [c for c in data.columns if not pd.api.types.is_numeric_dtype(data[c]) and not pd.api.types.is_datetime64_any_dtype(data[c])]
+            if text_cols:
+                mask = pd.Series(False, index=data.index)
+                for c in text_cols:
+                    mask |= data[c].astype(str).str.contains(search, case=False, regex=False, na=False)
+                view = data[mask]
+        if cols:
+            view = view[cols]
+        st.dataframe(view.head(limit), width="stretch", height=460, column_config=date_column_config(view))
+        st.caption(f"Showing {min(limit, len(view)):,} of {len(view):,} matching rows. Click a column header to sort.")
+        st.download_button("Download these rows as CSV", view.to_csv(index=False).encode("utf-8"),
+                           file_name="filtered_data.csv", mime="text/csv", icon=":material/download:")
+
+    with tab_profile:
+        st.dataframe(profile.summary_frame(), width="stretch", hide_index=True, height=460)
+        st.caption("Role is inferred from the data and column names. Identifiers are never summed; rates and prices are averaged.")
+
+    with tab_col:
+        col = st.selectbox("Column", list(profile.columns))
+        cp = profile.columns[col]
+        m = st.columns(4)
+        m[0].metric("Role", cp.role.title())
+        m[1].metric("Missing", f"{cp.missing:,} ({cp.missing_pct:.1f}%)")
+        m[2].metric("Unique values", f"{cp.unique:,}")
+        m[3].metric("Default aggregation", cp.aggregation if cp.role == METRIC else "—")
+        if cp.notes:
+            st.caption(" · ".join(cp.notes))
+        if cp.role == METRIC and cp.stats:
+            s = cp.stats
+            st.dataframe(pd.DataFrame({
+                "Statistic": ["Min", "Q1", "Median", "Mean", "Q3", "Max", "Std dev", "Sum", "Zeros", "Negatives", "Outliers (1.5×IQR)"],
+                "Value": [format_value(s[k]) for k in ("min", "q1", "median", "mean", "q3", "max", "std", "sum", "zeros", "negatives", "outliers")],
+            }), hide_index=True, width="content")
+        elif cp.role == DATE and cp.stats:
+            st.write(f"From **{cp.stats['min']:%Y-%m-%d}** to **{cp.stats['max']:%Y-%m-%d}** ({cp.stats['span_days']:,} days).")
+        elif cp.top_values:
+            st.dataframe(pd.DataFrame(cp.top_values, columns=[col, "Rows"]), hide_index=True, width="content")
+
+    with tab_notes:
+        if log:
+            st.markdown("**Changes you approved in the AI analysis**")
+            st.dataframe(pd.DataFrame([{"Change": t["description"], "Rows affected": t["rows_affected"],
+                                        "Why": t.get("reason", "")} for t in log]), hide_index=True, width="stretch")
+            st.markdown("**When the file was read**")
+        notes = result.warnings + profile.warnings
+        if notes:
+            for n in notes:
+                st.markdown(f"- {esc(n)}")
+        else:
+            st.write("No cleaning was needed.")
+        if result.conversions:
+            st.markdown("**Type conversions**")
+            st.dataframe(pd.DataFrame(list(result.conversions.items()), columns=["Column", "Converted to"]), hide_index=True, width="content")
+        if not result.removed_rows.empty:
+            st.markdown("**Rows excluded as totals/subtotals**")
+            st.dataframe(result.removed_rows, width="stretch")
+        st.markdown("**Original sheet (first 200 rows, as stored)**")
+        try:
+            st.dataframe(state.raw_preview(meta["id"], result.sheet if result.sheet != "CSV data" else None, meta["sha256"]), width="stretch", height=300)
+        except DataLoadError as exc:
+            st.warning(str(exc))
+
+
+def settings_page() -> None:
+    page_header("Workspace", "Settings", "Storage, limits and privacy.")
+    st.write("")
+    storage = state.get_storage()
+    with card("settings_storage"):
+        st.markdown("### Storage")
+        if config.ONLINE:
+            st.markdown(
+                "- This is the **online version**. Files you upload are sent to and processed on this app's server.\n"
+                "- Your files and dashboards are kept in a temporary folder that **only your browser session** can use. "
+                "Other visitors can't see them.\n"
+                f"- They are deleted after **{config.SESSION_TTL_MINUTES // 60} hours of inactivity**, whenever the server "
+                "restarts, or when you use *Delete my data now* below. Download a dashboard (My Dashboards → Save) to keep it.\n"
+                f"- Space used by your uploads: **{human_size(storage.disk_usage())}**\n"
+                f"- Upload limit: **{config.MAX_UPLOAD_MB} MB** · row limit: **{config.MAX_ROWS:,}**"
+            )
+            st.caption("Files are stored unencrypted on the server while your session lasts, and deletion is normal file "
+                       "deletion, not a secure wipe. Don't upload confidential or personal data to the online version; "
+                       "run the app on your own computer for that.")
+        else:
+            st.markdown(
+                f"- Uploaded files: `{esc(storage.upload_dir)}`\n"
+                f"- Dashboard configurations: `{esc(storage.dashboard_dir)}`\n"
+                f"- Space used by uploads: **{human_size(storage.disk_usage())}**\n"
+                f"- Upload limit: **{config.MAX_UPLOAD_MB} MB** · row limit: **{config.MAX_ROWS:,}** (change in `.env`)"
+            )
+            st.caption("Files are stored unencrypted on this computer and are not uploaded anywhere. Deleting removes the files "
+                       "with normal file deletion; it is not a secure wipe.")
+
+    with card("settings_datasets"):
+        st.markdown("### Uploaded datasets")
+        datasets = storage.list_datasets()
+        dashboards = storage.list_dashboards()
+        if not datasets:
+            st.caption("No datasets stored.")
+        for meta in datasets:
+            used = [d for d in dashboards if d.get("dataset_id") == meta["id"]]
+            c1, c2 = st.columns([4, 1], vertical_alignment="center")
+            c1.markdown(f"**{esc(meta['original_name'])}** · {human_size(meta['size'])} · uploaded {meta['uploaded_at'][:10]} · "
+                        f"used by {len(used)} dashboard(s)")
+            with c2.popover("Delete", width="stretch"):
+                st.write(f"Delete this file and the {len(used)} dashboard(s) built on it?")
+                if st.button("Delete permanently", key=f"ds_del_{meta['id']}", type="primary"):
+                    cur = state.current_dashboard()
+                    storage.delete_dataset(meta["id"])
+                    if (cur and cur.get("dataset_id") == meta["id"]) or (st.session_state.get("staging") or {}).get("dataset_id") == meta["id"]:
+                        state.close_dashboard()
+                    st.cache_data.clear()
+                    st.rerun()
+
+    with card("settings_clear"):
+        st.markdown("### Delete my data now" if config.ONLINE else "### Clear all local data")
+        st.caption("Removes every file you uploaded and every dashboard you saved in this session from the server."
+                   if config.ONLINE else "Removes every uploaded file and every saved dashboard from this computer.")
+        ok = st.checkbox("I understand this cannot be undone")
+        if st.button("Delete my data" if config.ONLINE else "Clear everything", disabled=not ok, icon=":material/delete_forever:"):
+            n_ds, n_db = storage.clear_all()
+            state.close_dashboard()
+            st.cache_data.clear()
+            st.session_state["cleared_msg"] = f"Removed {n_ds} dataset(s) and {n_db} dashboard(s)."
+            st.rerun()  # refresh the lists above so they no longer show the deleted files
+        if st.session_state.get("cleared_msg"):
+            st.success(st.session_state.pop("cleared_msg"))
+
+    with card("settings_ai"):
+        from ..agent.llm import provider_status
+
+        ai = provider_status()
+        st.markdown("### AI assistant")
+        if ai["enabled"]:
+            sent = ("- **Runs on this computer.** Nothing is sent anywhere.\n" if ai["local"] else
+                    "- **What is sent, only when you allow it for an analysis:** column names, summary statistics, the "
+                    "most common values per column, up to 5 example rows, your messages and answers. The full file is "
+                    f"never sent. {ai['data_note']}\n")
+            st.markdown(
+                f"- **Provider:** {ai['provider']} · model `{ai['model']}` · {ai['cost']}\n" + sent
+                + "- **What stays here:** every calculation, cleaning step and chart is done by the app's own pandas "
+                "engine. The AI plans and explains, but never produces the numbers.\n"
+                "- Pick the offline guided assistant when you start an analysis (or switch any time) to avoid AI services."
+            )
+        else:
+            st.markdown(
+                f"The **guided assistant** is active: it runs entirely on this {'server' if config.ONLINE else 'computer'} "
+                "with fixed rules, and nothing is sent to an AI service.\n\n"
+                f"_{ai['reason']}_ Free options: start **Ollama** with a tool-capable model (e.g. `qwen3:4b`), or put a "
+                "Google AI Studio key in `.env` as `GEMINI_API_KEY`, then restart the app. See the README."
+            )
+        st.caption("Either way, insights and answers are calculated with pandas from your data, and all numbers come "
+                   "from those calculations.")
+        from ..agent import usage
+
+        st.markdown("#### AI usage & free limits")
+        rows = usage.summary()
+        if rows:
+            st.dataframe(
+                [{"Provider": r["provider"], "Model": r["model"], "Requests today": str(r["used"] or 0),
+                  "Limit": f"{r['limit']:,}" if r["limit"] is not None else ("∞" if r["kind"] == "unlimited" else "?"),
+                  "Left": f"{r['left']:,}" if r["left"] is not None else ("∞" if r["kind"] == "unlimited" else "?"),
+                  "Status": r["text"]} for r in rows],
+                hide_index=True, width="stretch")
+        else:
+            st.caption("No AI requests yet.")
+        st.caption("Counts are requests made by this app. Groq, OpenRouter and Claude report exact remaining numbers; "
+                   "Google Gemini doesn't, so the app counts requests itself (resetting at midnight Pacific time) and "
+                   "learns the limit the first time Google reports it. Ollama runs locally and is unlimited. Other apps "
+                   "using the same key share the same quota.")

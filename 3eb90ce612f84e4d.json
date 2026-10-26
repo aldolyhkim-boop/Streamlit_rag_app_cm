@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "3eb90ce612f84e4d",
+  "name": "46 - Sales-Data \u00b7 Sheet1",
+  "dataset_id": "f6063a2589ef43d6",
+  "dataset_name": "46 - Sales-Data.xlsx",
+  "sheet": "Sheet1",
+  "header_row": null,
+  "created_at": "2026-10-24T16:09:03+00:00",
+  "updated_at": "2026-10-24T16:09:11+00:00",
+  "charts": [],
+  "kpis": [
+    {
+      "id": "49e0c009fa32",
+      "kind": "count",
+      "label": "Records",
+      "column": null,
+      "agg": "count",
+      "description": "Number of rows after filters."
+    }
+  ],
+  "filters": {
+    "categorical": {},
+    "date": {}
+  },
+  "filter_columns": [],
+  "column_overrides": {},
+  "cleaning_ops": [],
+  "renames": {},
+  "column_notes": {},
+  "analysis": null,
+  "theme": null
+}
